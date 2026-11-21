@@ -43,3 +43,24 @@ Works only on retail (World of Warcraft Dragonflight).
 
 ## Disclaimer
 Using the **1st World of Warcraft Audio-based Fishing Bot** may violate the World of Warcraft's terms of service and result in penalties, including getting banned. The creator of the **1st World of Warcraft Audio-based Fishing Bot** is not liable for any consequences or damages caused by its use. Use at your own risk!
+### Automatic Shiny Baubles (Python app)
+
+Equip your main-hand fishing pole, put this macro on an action bar, and bind it
+to F7 (or choose another F1–F12 key in the app). Keep F6 bound to the fishing
+addon for both casting and looting.
+
+```text
+#showtooltip Shiny Bauble
+/use Shiny Bauble
+/use 16
+```
+
+Automatic lures default to enabled, with a 600-second lure duration, a
+590-second refresh interval and a 1.5-second delay before casting. The worker
+sends the macro once before the first cast. If a refresh comes due while
+listening, it waits until the current fishing cycle finishes. The timer tracks
+keypress attempts; the app cannot check inventory or confirm the in-game buff.
+
+Start saves lure settings to `%APPDATA%\FishingAssistant\lures.json`.
+Stop pauses the session; Start resumes listening and checks the timer before
+the next cast. Reopening the app starts a fresh session.

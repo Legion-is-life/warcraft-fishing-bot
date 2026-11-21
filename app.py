@@ -1,3 +1,8 @@
+import json
+import math
+import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
 import queue
 import random
 import threading
@@ -34,6 +39,36 @@ FONT = "Segoe UI"
 MONO = "Consolas"
 
 
+CONFIG = Path(os.environ.get("APPDATA") or Path.home()) / "FishingAssistant" / "lures.json"
+LURE_KEYS = tuple(f"F{i}" for i in range(1, 13) if i != 6)
+
+
+@dataclass(frozen=True)
+class LureSettings:
+    enabled: bool = True
+    key: str = "F7"
+    duration: int = 600
+    interval: int = 590
+    delay: float = 1.5
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool or self.key not in LURE_KEYS:
+            raise ValueError("Choose a lure function key other than F6.")
+        if not 1 <= self.interval <= self.duration <= 86400:
+            raise ValueError("Use 1 to 86400 seconds, with interval <= duration.")
+        if not math.isfinite(self.delay) or not 0 <= self.delay < self.interval:
+            raise ValueError("Delay must be nonnegative and shorter than the interval.")
+
+
+def load_lures():
+    try:
+        return LureSettings(**json.loads(CONFIG.read_text(encoding="utf-8"))), None
+    except FileNotFoundError:
+        return LureSettings(), None
+    except (OSError, ValueError, TypeError) as exc:
+        return LureSettings(), f"Using default lure settings: {exc}"
+
+
 def find_loopback(p, name):
     """Resolve in the capture session; device indices can change on reconnect."""
     if name == DEFAULT_OUTPUT:
@@ -53,29 +88,44 @@ def find_loopback(p, name):
 
 
 class Worker(threading.Thread):
-    def __init__(self, events, shared, hwnd, device_name, initial_cast):
+    def __init__(self, events, shared, hwnd, device_name, initial_cast, lures, last_attempt):
         super().__init__(daemon=True)
         self.events = events
         self.shared = shared
         self.hwnd = hwnd
         self.device_name = device_name
+        self.lures = lures
+        self.last_attempt = last_attempt
         self.initial_cast = initial_cast
         self.stop = threading.Event()
 
     def emit(self, *event):
         self.events.put(event)
 
-    def make_cast(self):
-        scan = win32api.MapVirtualKey(win32con.VK_F6, 0)
+    def press(self, key):
+        scan = win32api.MapVirtualKey(key, 0)
         down = 1 | (scan << 16)
-        up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+        win32api.PostMessage(self.hwnd, win32con.WM_KEYDOWN, key, down)
+        win32api.PostMessage(self.hwnd, win32con.WM_KEYUP, key, down | (3 << 30))
 
-        def cast(is_bait):
-            win32api.PostMessage(self.hwnd, win32con.WM_KEYDOWN, win32con.VK_F6, down)
-            win32api.PostMessage(self.hwnd, win32con.WM_KEYUP, win32con.VK_F6, up)
-            self.emit("bait" if is_bait else "catch")
-
-        return cast
+    def before_cast(self):
+        if self.stop.is_set():
+            return False
+        cfg = self.lures
+        if cfg.enabled:
+            now = time.monotonic()
+            if self.last_attempt is None or now - self.last_attempt >= cfg.interval:
+                self.last_attempt = now
+                self.emit("info", f"Applying Shiny Bauble ({cfg.key}); next attempt in {cfg.interval}s.")
+                self.press(win32con.VK_F1 + int(cfg.key[1:]) - 1)
+            remaining = cfg.delay - (time.monotonic() - self.last_attempt)
+            if remaining > 0 and self.stop.wait(remaining):
+                return False
+        if self.stop.is_set():
+            return False
+        self.press(win32con.VK_F6)
+        self.emit("bait")
+        return True
 
     def run(self):
         p = None
@@ -90,11 +140,13 @@ class Worker(threading.Thread):
                             input_device_index=device["index"],
                             frames_per_buffer=CHUNK, start=False)
             self.emit("audio", device["name"], rate, channels)
-            cast = self.make_cast()
+            if self.lures.enabled:
+                self.emit("info", "Automatic fishing lures enabled.")
             if self.stop.is_set():
                 return
             if self.initial_cast:
-                cast(True)
+                if not self.before_cast():
+                    return
                 self.emit("settle")
                 if self.stop.wait(LISTEN_DELAY):
                     return
@@ -122,7 +174,8 @@ class Worker(threading.Thread):
                         self.emit("splash", db)
                         if self.stop.wait(random.uniform(0.5, 1)):
                             break
-                        cast(False)
+                        self.press(win32con.VK_F6)
+                        self.emit("catch")
                         break
                     if time.time() - started > CAST_TIMEOUT:
                         self.emit("timeout")
@@ -134,7 +187,8 @@ class Worker(threading.Thread):
                 self.emit("wait")
                 if self.stop.wait(random.uniform(3, 5)):
                     break
-                cast(True)
+                if not self.before_cast():
+                    return
                 self.emit("settle")
                 if self.stop.wait(LISTEN_DELAY):
                     break
@@ -162,6 +216,8 @@ class App:
         self.shared = {"threshold": DEFAULT_THRESHOLD}
         self.worker = None
         self.first_start = True
+        self.last_attempt = None
+        self.lures, config_warning = load_lures()
         self.db = DB_FLOOR
         self.run_started = None
         self.elapsed_before = 0.0
@@ -169,6 +225,8 @@ class App:
         self.counts = {"casts": 0}
 
         self.build()
+        if config_warning:
+            self.log(config_warning, "red")
         self.refresh_devices()
         root.update_idletasks()
         width = max(560, root.winfo_reqwidth())
@@ -208,6 +266,24 @@ class App:
         self.refresh_btn = tk.Button(audio, text="Refresh devices",
                                       command=self.refresh_devices)
         self.refresh_btn.pack(anchor="e", padx=16, pady=(4, 10))
+
+        lure = tk.Frame(self.root, bg=PANEL)
+        lure.pack(fill="x", padx=pad, pady=4)
+        self.lure_enabled = tk.BooleanVar(value=self.lures.enabled)
+        check = ttk.Checkbutton(lure, text="Automatic Shiny Baubles", variable=self.lure_enabled)
+        check.grid(row=0, column=0, columnspan=4, sticky="w")
+        self.lure_widgets = [check]
+        self.lure_fields = {}
+        for col, (field, label) in enumerate((("key", "Key"), ("duration", "Duration (s)"),
+                                               ("interval", "Interval (s)"), ("delay", "Delay (s)"))):
+            ttk.Label(lure, text=label).grid(row=1, column=col, sticky="w", padx=4)
+            var = tk.StringVar(value=str(getattr(self.lures, field)))
+            self.lure_fields[field] = var
+            widget = (ttk.Combobox(lure, values=LURE_KEYS, textvariable=var, width=8,
+                                   state="readonly") if field == "key" else
+                      ttk.Entry(lure, textvariable=var, width=10))
+            widget.grid(row=2, column=col, padx=4, pady=2)
+            self.lure_widgets.append(widget)
 
         sound = tk.Frame(self.root, bg=PANEL)
         sound.pack(fill="x", padx=pad, pady=8)
@@ -293,6 +369,8 @@ class App:
         return b
 
     def set_buttons(self, running):
+        for widget in self.lure_widgets:
+            widget.state(["disabled" if running else "!disabled"])
         self.audio_combo.configure(state="disabled" if running else "readonly")
         self.refresh_btn.configure(state="disabled" if running else "normal")
         self.start_btn.configure(state="disabled" if running else "normal",
@@ -379,8 +457,23 @@ class App:
             messagebox.showerror("Game not found",
                                  f"Couldn't find a window titled '{WINDOW_TITLE}'.\nOpen the game and try again.")
             return
+        fields = {k: v.get() for k, v in self.lure_fields.items()}
+        try:
+            self.lures = LureSettings(self.lure_enabled.get(), fields["key"],
+                                      int(fields["duration"]), int(fields["interval"]),
+                                      float(fields["delay"]))
+        except ValueError as exc:
+            messagebox.showerror("Invalid lure settings", str(exc))
+            return
+        try:
+            CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            temp = CONFIG.with_suffix(f".{os.getpid()}.tmp")
+            temp.write_text(json.dumps(asdict(self.lures), indent=2), encoding="utf-8")
+            temp.replace(CONFIG)
+        except OSError as exc:
+            self.log(f"Could not save lure settings: {exc}", "red")
         self.worker = Worker(self.events, self.shared, hwnd,
-                             self.audio_name.get(), self.first_start)
+                             self.audio_name.get(), self.first_start, self.lures, self.last_attempt)
         self.run_started = time.time()
         self.worker.start()
         self.set_buttons(running=True)
@@ -425,6 +518,8 @@ class App:
             self.cast_started = None
             self.set_status("Recasting soon", GOLD)
             self.hint.configure(text="Pausing before the next cast")
+        elif kind == "info":
+            self.log(event[1], "water")
         elif kind == "audio":
             self.log(f"Capturing {event[1]} ({event[2]} Hz, {event[3]} channels)", "water")
         elif kind == "error":
@@ -434,6 +529,7 @@ class App:
                 self.elapsed_before += time.time() - self.run_started
             self.run_started = None
             self.cast_started = None
+            self.last_attempt = self.worker.last_attempt
             self.worker = None
             self.db = DB_FLOOR
             self.db_label.configure(text="--", fg=TEXT)
